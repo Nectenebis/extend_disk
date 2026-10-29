@@ -1,9 +1,1 @@
----
-extend_disk_packages:
-  - lvm2
-  - parted
-  - xfsprogs
-  - e2fsprogs
-
-# Set to true to show what would be extended without changing disks.
-extend_disk_dry_run: false
+defaults/main.yml

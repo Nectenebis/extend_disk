@@ -1,0 +1,13 @@
+- name: Validate the role without applying disk changes
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  vars:
+    # Check mode tests role loading/copying without a system package install.
+    extend_disk_packages: []
+    extend_disk_dry_run: true
+    extend_disk_devices:
+      - /dev/sda
+      - /dev/sdb
+  roles:
+    - role: "{{ playbook_dir }}/.."

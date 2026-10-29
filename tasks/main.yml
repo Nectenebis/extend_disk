@@ -1,0 +1,40 @@
+---
+- name: Validate platform and disk selection
+  ansible.builtin.assert:
+    that:
+      - ansible_facts['system'] == 'Linux'
+      - ansible_facts['pkg_mgr'] in ['apt', 'dnf', 'dnf5', 'yum']
+      - extend_disk_devices is sequence
+      - extend_disk_devices is not string
+      - extend_disk_devices is not mapping
+    fail_msg: This role requires Linux with apt/dnf/yum and a list of disk paths.
+
+- name: Install packages for disk resize
+  ansible.builtin.package:
+    name: "{{ extend_disk_packages }}"
+    state: present
+  when: extend_disk_packages | length > 0
+
+- name: Copy disk resize helper
+  ansible.builtin.copy:
+    src: extend_free_space.py
+    dest: /usr/local/sbin/extend-free-space
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Find and extend disks with free space
+  ansible.builtin.command:
+    argv: >-
+      {{ ['/usr/local/sbin/extend-free-space']
+         + (['--dry-run'] if extend_disk_dry_run | bool else [])
+         + (extend_disk_devices | map('regex_replace', '^', '--disk=') | list) }}
+  register: extend_disk_result
+  changed_when: "'CHANGED:' in extend_disk_result.stdout"
+  # In check mode the helper may not exist yet, so don't run an old/absent copy.
+  when: not ansible_check_mode
+
+- name: Show disk resize result
+  ansible.builtin.debug:
+    msg: "{{ extend_disk_result.stdout_lines }}"
+  when: extend_disk_result.stdout_lines is defined

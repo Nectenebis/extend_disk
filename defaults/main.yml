@@ -1,0 +1,28 @@
+---
+extend_disk_packages_by_manager:
+  apt:
+    - python3
+    - lvm2
+    - cloud-guest-utils
+    - util-linux
+    - udev
+    - xfsprogs
+    - e2fsprogs
+  rpm:
+    - python3
+    - lvm2
+    - cloud-utils-growpart
+    - util-linux
+    - systemd-udev
+    - xfsprogs
+    - e2fsprogs
+
+# Debian/Astra use apt; RED OS uses dnf/yum. Override for local repositories.
+extend_disk_packages: >-
+  {{ extend_disk_packages_by_manager['apt' if ansible_facts['pkg_mgr'] == 'apt' else 'rpm'] }}
+
+# Set to true to show what would be extended without changing disks.
+extend_disk_dry_run: false
+
+# Empty means automatic discovery. Example: ['/dev/sda', '/dev/sdb'].
+extend_disk_devices: []
