@@ -26,3 +26,8 @@ extend_disk_dry_run: false
 
 # Empty means automatic discovery. Example: ['/dev/sda', '/dev/sdb'].
 extend_disk_devices: []
+
+# Per-disk overrides; other disks keep automatic selection. Comma/space separated.
+# Bare path gets the VG remainder; sizes are ADDED, percentages use post-growth VG free space.
+# Examples: "/second_data", "/data=20GiB, /logs", "/data=40% /logs=60%".
+extend_disk_mountpoints: ""

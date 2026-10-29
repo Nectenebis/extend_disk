@@ -7,7 +7,8 @@
       - extend_disk_devices is sequence
       - extend_disk_devices is not string
       - extend_disk_devices is not mapping
-    fail_msg: This role requires Linux with apt/dnf/yum and a list of disk paths.
+      - extend_disk_mountpoints is string
+    fail_msg: This role requires Linux with apt/dnf/yum, a list of disk paths and a mountpoints string.
 
 - name: Install packages for disk resize
   ansible.builtin.package:
@@ -28,6 +29,7 @@
     argv: >-
       {{ ['/usr/local/sbin/extend-free-space']
          + (['--dry-run'] if extend_disk_dry_run | bool else [])
+         + (['--mountpoints=' + extend_disk_mountpoints] if extend_disk_mountpoints | trim else [])
          + (extend_disk_devices | map('regex_replace', '^', '--disk=') | list) }}
   register: extend_disk_result
   changed_when: "'CHANGED:' in extend_disk_result.stdout"

@@ -6,6 +6,7 @@
     # Check mode tests role loading/copying without a system package install.
     extend_disk_packages: []
     extend_disk_dry_run: true
+    extend_disk_mountpoints: "/data=20GiB, /logs"
     extend_disk_devices:
       - /dev/sda
       - /dev/sdb

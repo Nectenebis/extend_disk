@@ -60,6 +60,9 @@ class PartitionImages(unittest.TestCase):
         self.extend(96 * MIB)  # Same stale backup-GPT condition as after vCenter expansion.
         digest = self.digest()
         self.assertTrue(h.probe_partition(str(self.path), old["node"]))
+        with patch.object(h, "device_size", return_value=old["size"] * before["sectorsize"]):
+            plan = h.plan_partition(str(self.path), old["node"])
+        self.assertGreater(plan["expected"], old["size"] * before["sectorsize"])
         self.assertEqual(self.digest(), digest, "dry-run modified the image")
         self.cli("growpart", "--update=off", str(self.path), "2")
         after = self.table()

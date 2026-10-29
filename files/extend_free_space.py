@@ -15,6 +15,10 @@ SUPPORTED_FS = {"xfs", "ext4"}
 SUPPORTED_DISK_RE = r"^(sd[a-z]+|vd[a-z]+|xvd[a-z]+|nvme[0-9]+n[0-9]+)$"
 
 
+class AmbiguousTarget(RuntimeError):
+    """Automatic selection needs an explicit mounted filesystem."""
+
+
 def command(argv):
     return subprocess.run(argv, text=True, capture_output=True, env=dict(os.environ, LC_ALL="C"))
 
@@ -98,7 +102,38 @@ def find_root_node(nodes):
     return next((n for n in nodes if os.path.realpath(n["path"]) == source), None)
 
 
-def discover_targets(blockdevices, selected=None):
+def parse_mountpoints(value):
+    requests = {}
+    units = {"B": 1, "KIB": 1024, "MIB": 1024 ** 2, "GIB": 1024 ** 3, "TIB": 1024 ** 4}
+    for entry in re.split(r"[,\s]+", value.strip()):
+        if not entry:
+            continue
+        path, separator, amount = entry.partition("=")
+        if not path.startswith("/"):
+            raise ValueError("Use an absolute mountpoint: " + entry)
+        path = os.path.normpath(path)
+        allocation = dict(type="all")
+        if separator:
+            match = re.fullmatch(r"(\d+(?:\.\d+)?)(%|B|KiB|MiB|GiB|TiB)", amount, re.I)
+            if not match or Decimal(match.group(1)) <= 0:
+                raise ValueError("Invalid allocation {0}; use e.g. /data=20GiB, /logs=40%, /archive".format(entry))
+            number, unit = Decimal(match.group(1)), match.group(2).upper()
+            if unit == "%":
+                if number > 100:
+                    raise ValueError("Percentage exceeds 100: " + entry)
+                allocation = dict(type="percent", value=number)
+            else:
+                size = number * units[unit]
+                if size != int(size):
+                    raise ValueError("Size must be a whole number of bytes: " + entry)
+                allocation = dict(type="bytes", value=int(size))
+        if path in requests and requests[path]["allocation"] != allocation:
+            raise ValueError("Conflicting allocations for mountpoint " + path)
+        requests[path] = dict(mountpoint=path, allocation=allocation)
+    return list(requests.values())
+
+
+def discover_targets(blockdevices, selected=None, requests=None):
     nodes = list(walk(blockdevices))
     root = find_root_node(nodes)
     if root is None and not selected:
@@ -106,34 +141,68 @@ def discover_targets(blockdevices, selected=None):
     root_disk = disk_for(root)
     targets, skipped = [], []
 
-    def add(device, kind, disk, pv=None):
+    def add(device, kind, disk, pv=None, request=None):
+        def reject(message):
+            if request:
+                raise RuntimeError(message)
+            skipped.append("SKIP: " + message)
+
         if not supported_disk(disk):
-            skipped.append("SKIP: unsupported physical disk for " + device["path"])
+            reject("unsupported physical disk for " + device["path"])
             return
         if not can_grow_filesystem(device):
-            skipped.append("SKIP: unsupported or unmounted filesystem: " + device["path"])
+            reject("unsupported or unmounted filesystem: " + device["path"])
             return
         parent = device.get("parent") or {}
         if pv is None and (device.get("type") != "part" or parent.get("type") != "disk"
                            or device.get("children")):
-            skipped.append("SKIP: unsupported storage layers: " + device["path"])
+            reject("unsupported storage layers: " + device["path"])
             return
         if pv is not None and not (pv.get("type") == "disk" or
                                     (pv.get("type") == "part" and pv.get("parent", {}).get("type") == "disk")):
-            skipped.append("SKIP: unsupported PV storage layers: " + device["path"])
+            reject("unsupported PV storage layers: " + device["path"])
             return
+        if request and pv is None and request["allocation"]["type"] != "all":
+            raise RuntimeError("Sizes and percentages require an LVM logical volume: " + request["mountpoint"])
         targets.append(dict(kind=kind, device=device["path"], disk=disk, pv=pv,
                             part=(pv if pv and pv["type"] == "part" else device if pv is None else None),
-                            fs=node_fstype(device), mountpoint=(mountpoints(device) or [None])[0]))
+                            fs=node_fstype(device), mountpoint=(request["mountpoint"] if request else
+                                                              (mountpoints(device) or [None])[0]),
+                            explicit=bool(request), allocation=(request["allocation"] if request else dict(type="all"))))
 
-    if root and root_disk and (not selected or root_disk["path"] in selected):
+    overridden = set()
+    explicit_devices = {}
+    for request in requests or []:
+        matches = [n for n in nodes if request["mountpoint"] in mountpoints(n)]
+        if not matches:
+            raise RuntimeError("Not an exact mounted filesystem: " + request["mountpoint"])
+        disks = {disk_for(n)["path"] for n in matches if disk_for(n)}
+        if len(disks) != 1:
+            raise RuntimeError("Mountpoint does not resolve to one physical disk: " + request["mountpoint"])
+        device, disk = matches[0], disk_for(matches[0])
+        if selected and disk["path"] not in selected:
+            raise RuntimeError("Mountpoint is outside the --disk selection: " + request["mountpoint"])
+        key = os.path.realpath(device["path"])
+        if key in explicit_devices:
+            if explicit_devices[key] != request["allocation"]:
+                raise RuntimeError("Conflicting mountpoint aliases for " + device["path"])
+            continue
+        if device["type"] not in ("part", "lvm"):
+            raise RuntimeError("Unsupported selected storage layout: " + request["mountpoint"])
+        add(device, "system" if root_disk and disk["path"] == root_disk["path"] else "data", disk,
+            device.get("parent") if device["type"] == "lvm" else None, request)
+        overridden.add(disk["path"])
+        explicit_devices[key] = request["allocation"]
+
+    if root and root_disk and root_disk["path"] not in overridden and (not selected or root_disk["path"] in selected):
         if root["type"] in ("part", "lvm"):
             add(root, "system", root_disk, root.get("parent") if root["type"] == "lvm" else None)
         else:
             skipped.append("SKIP: unsupported root storage layout")
 
     for disk in (n for n in nodes if supported_disk(n)):
-        if (root_disk and disk["path"] == root_disk["path"]) or (selected and disk["path"] not in selected):
+        if (disk["path"] in overridden or (root_disk and disk["path"] == root_disk["path"])
+                or (selected and disk["path"] not in selected)):
             continue
         children = [n for n in nodes if n.get("parent") is disk]
         parts = [n for n in children if n["type"] == "part"]
@@ -142,7 +211,7 @@ def discover_targets(blockdevices, selected=None):
             if len(lvs) == 1 and len(children) == 1:
                 add(lvs[0], "data", disk, disk)
             else:
-                skipped.append("SKIP: unsupported or ambiguous disk layout: " + disk["path"])
+                skipped.append(ambiguity_message(disk, nodes, "unsupported or ambiguous disk layout"))
         elif len(parts) == 1 and len(children) == 1:
             part = parts[0]
             descendants = [n for n in nodes if n.get("parent") is part]
@@ -151,13 +220,19 @@ def discover_targets(blockdevices, selected=None):
             elif len(descendants) == 1 and descendants[0]["type"] == "lvm":
                 add(descendants[0], "data", disk, part)
             else:
-                skipped.append("SKIP: multiple LVs or unsupported storage layers: " + part["path"])
+                skipped.append(ambiguity_message(disk, nodes, "multiple LVs or unsupported storage layers"))
         else:
-            skipped.append("SKIP: data disk must have exactly one partition: " + disk["path"])
+            skipped.append(ambiguity_message(disk, nodes, "data disk must have exactly one partition for automatic selection"))
     unique = {}
     for target in targets:
         unique.setdefault(target["device"], target)
     return list(unique.values()), skipped
+
+
+def ambiguity_message(disk, nodes, reason):
+    candidates = sorted({point for node in nodes if disk_for(node) is disk for point in mountpoints(node)})
+    return "SKIP: {0}: {1}. Select the filesystem in extend_disk_mountpoints / --mountpoints{2}".format(
+        disk["path"], reason, ": " + ", ".join(candidates) if candidates else "")
 
 
 def rescan_block_devices(disks):
@@ -180,25 +255,53 @@ def rescan_block_devices(disks):
     run(["udevadm", "settle"])
 
 
-def partition_size(disk_path, part_path):
+def partition_table(disk_path):
     table = json.loads(run(["sfdisk", "--json", disk_path]))["partitiontable"]
     if table["label"] not in ("gpt", "dos"):
         raise RuntimeError("Unsupported partition table on " + disk_path)
+    return table
+
+
+def partition_size(disk_path, part_path):
+    table = partition_table(disk_path)
     for part in table["partitions"]:
         if os.path.realpath(part["node"]) == os.path.realpath(part_path):
             return integer(part["size"]) * integer(table["sectorsize"])
     raise RuntimeError("Partition not found in on-disk table: " + part_path)
 
 
-def probe_partition(disk_path, part_path):
+def growpart_probe(disk_path, part_path):
     argv = ["growpart", "--dry-run", "--update=off", disk_path, part_number(part_path)]
     result = command(argv)
     if result.returncode == 1 and result.stdout.startswith("NOCHANGE:"):
-        return False
+        return result
     if result.returncode == 0 and result.stdout.startswith("CHANGE:"):
-        return True
+        return result
     raise RuntimeError("Cannot plan partition growth: {0}\n{1}\n{2}".format(
         " ".join(argv), result.stdout.strip(), result.stderr.strip()))
+
+
+def probe_partition(disk_path, part_path):
+    return growpart_probe(disk_path, part_path).returncode == 0
+
+
+def plan_partition(disk_path, part_path):
+    before = partition_size(disk_path, part_path)
+    current = device_size(part_path)
+    if current > before:
+        raise RuntimeError("Kernel size exceeds the on-disk partition size: " + part_path)
+    result = growpart_probe(disk_path, part_path)
+    grow = result.returncode == 0
+    expected = before
+    if grow:
+        match = re.search(r"\bnew:\s+size=(\d+)\b", result.stdout)
+        if not match:
+            raise RuntimeError("Cannot read growpart projected size: " + result.stdout)
+        expected = int(match.group(1)) * integer(partition_table(disk_path)["sectorsize"])
+        if expected <= before:
+            raise RuntimeError("Invalid projected partition size: " + part_path)
+    return dict(disk=disk_path, path=part_path, grow=grow, expected=expected, current=current,
+                reason=result.stdout.strip())
 
 
 def resize_partition(disk_path, part_path, grow):
@@ -254,8 +357,9 @@ def lvm_state(target):
     matching = [lv for lv in in_vg if os.path.realpath(lv["lv_path"]) == os.path.realpath(target["device"])]
     if not matching or any(lv["segtype"] != "linear" or not lv["lv_attr"].startswith("-") for lv in matching):
         raise RuntimeError("Only ordinary linear LVs are supported: " + target["device"])
-    if target["kind"] == "data" and len({lv["lv_path"] for lv in in_vg}) != 1:
-        raise RuntimeError("Refusing to choose between multiple data LVs in VG " + vg)
+    if target["kind"] == "data" and not target.get("explicit") and len({lv["lv_path"] for lv in in_vg}) != 1:
+        raise AmbiguousTarget("Refusing to choose between multiple data LVs in VG {0}; "
+                              "select a mountpoint in extend_disk_mountpoints / --mountpoints".format(vg))
     vgs = report("vgs", "vg_name,vg_extent_size", "vg")
     extent_size = integer(next(row["vg_extent_size"] for row in vgs if row["vg_name"] == vg))
     return dict(pv=pv, extent_size=extent_size,
@@ -283,7 +387,7 @@ def grow_filesystem(target):
     if capacity < before:
         raise RuntimeError("Filesystem exceeds its block device size: " + target["device"])
     if capacity == before:
-        return
+        return False
     if target["fs"] == "ext4":
         run(["resize2fs", target["device"]])
     else:
@@ -291,6 +395,138 @@ def grow_filesystem(target):
     after, _ = filesystem_geometry(target)
     if after > before:
         print("CHANGED: filesystem " + target["device"])
+    return after > before
+
+
+def allocate_extents(targets, free, extent_size):
+    remainders = [t for t in targets if t["allocation"]["type"] == "all"]
+    if len(remainders) > 1:
+        raise ValueError("Several paths would consume the same VG remainder; specify sizes/percentages for all but one")
+    percentages = sum((t["allocation"]["value"] for t in targets
+                       if t["allocation"]["type"] == "percent"), Decimal(0))
+    if percentages > 100:
+        raise ValueError("Combined percentages in one VG exceed 100%")
+    fixed = any(t["allocation"]["type"] == "bytes" for t in targets)
+    if percentages == 100 and fixed:
+        raise ValueError("100% of VG free space leaves no room for fixed-size requests")
+    allocations = {t["device"]: 0 for t in targets}
+    if free == 0:
+        return allocations
+    fractions = {}
+    for target in targets:
+        spec = target["allocation"]
+        if spec["type"] == "bytes":
+            allocations[target["device"]] = (spec["value"] + extent_size - 1) // extent_size
+        elif spec["type"] == "percent":
+            value = Decimal(free) * spec["value"] / 100
+            allocations[target["device"]] = int(value)
+            fractions[target["device"]] = value - int(value)
+    requested = sum(allocations.values())
+    if requested > free:
+        raise ValueError("Insufficient VG space: requested {0} extents ({1} bytes), available {2} ({3} bytes)".format(
+            requested, requested * extent_size, free, free * extent_size))
+    if remainders:
+        allocations[remainders[0]["device"]] = free - requested
+    elif percentages == 100:
+        # Largest remainder rounding consumes all extents, independent of input order.
+        for device in sorted(fractions, key=lambda item: (-fractions[item], item))[:free - requested]:
+            allocations[device] += 1
+    return allocations
+
+
+def prepare_explicit_targets(targets):
+    groups, partitions = {}, {}
+    for target in targets:
+        if not target.get("explicit"):
+            continue
+        blocks, block_size = filesystem_geometry(target)
+        if blocks * block_size > device_size(target["device"]):
+            raise RuntimeError("Filesystem exceeds its block device size: " + target["device"])
+        part = target["part"]
+        partition = None
+        if part:
+            key = (target["disk"]["path"], part["path"])
+            if key not in partitions:
+                partitions[key] = plan_partition(*key)
+            partition = partitions[key]
+        state = lvm_state(target) if target["pv"] else None
+        key = ("vg", state["pv"]["vg_name"]) if state else ("partition", target["device"])
+        if key not in groups:
+            groups[key] = dict(targets=[], state=state, partitions=[], allocations={})
+        group = groups[key]
+        group["targets"].append(target)
+        if partition and partition not in group["partitions"]:
+            group["partitions"].append(partition)
+    for group in groups.values():
+        state = group["state"]
+        if state is None:
+            continue
+        target = group["targets"][0]
+        if len(group["partitions"]) > 1:
+            raise RuntimeError("Several PV partitions in one VG are not supported")
+        expected = (group["partitions"][0]["expected"] if group["partitions"] else
+                    device_size(target["pv"]["path"]))
+        count = (expected - integer(state["pv"]["pe_start"])) // state["extent_size"]
+        if count < integer(state["pv"]["pv_pe_count"]):
+            raise RuntimeError("PV metadata exceeds its projected block device size: " + target["pv"]["path"])
+        group["forecast_free"] = count - integer(state["pv"]["pv_pe_alloc_count"])
+        try:
+            group["allocations"] = allocate_extents(group["targets"], group["forecast_free"], state["extent_size"])
+        except ValueError as error:
+            raise ValueError("VG {0} ({1}): {2}".format(state["pv"]["vg_name"],
+                             ", ".join(t["mountpoint"] for t in group["targets"]), error))
+    return list(groups.values())
+
+
+def process_explicit_group(group, dry_run):
+    state = group["state"]
+    for partition in group["partitions"]:
+        if dry_run:
+            print("DRY-RUN: {0}: partition growth={1}, projected bytes={2}".format(
+                partition["path"], partition["grow"], partition["expected"]))
+        else:
+            resize_partition(partition["disk"], partition["path"], partition["grow"])
+            if not partition["grow"] and partition["current"] == partition["expected"]:
+                print("SKIP: {0}: {1}; checking filesystem capacity".format(
+                    partition["path"], partition.get("reason", "no contiguous free space after partition")))
+    allocations = group["allocations"]
+    if state and not dry_run:
+        target = group["targets"][0]
+        pv_path = target["pv"]["path"]
+        current = lvm_state(target)
+        capacity = (device_size(pv_path) - integer(current["pv"]["pe_start"])) // current["extent_size"]
+        if capacity < integer(current["pv"]["pv_pe_count"]):
+            raise RuntimeError("PV metadata exceeds its block device size: " + pv_path)
+        if capacity > integer(current["pv"]["pv_pe_count"]):
+            run(["pvresize", pv_path])
+            current = lvm_state(target)
+        if integer(current["pv"]["pv_pe_count"]) > integer(state["pv"]["pv_pe_count"]):
+            print("CHANGED: PV " + pv_path)
+        # Freeze one actual post-pvresize snapshot for all LV allocations in the VG.
+        allocations = allocate_extents(group["targets"], current["free"], current["extent_size"])
+    for target in group["targets"]:
+        if state:
+            extents = allocations[target["device"]]
+            print("{0}: {1}: add {2} extents ({3} bytes)".format(
+                "DRY-RUN" if dry_run else "PLAN", target["mountpoint"], extents, extents * state["extent_size"]))
+            if not dry_run and extents:
+                run(["lvextend", "-l", "+{0}".format(extents), target["device"], target["pv"]["path"]])
+                print("CHANGED: LV " + target["device"])
+            if not extents:
+                print("SKIP: {0}: no available extents for this allocation".format(target["mountpoint"]))
+        if dry_run:
+            print("DRY-RUN: check/grow {0} filesystem {1} ({2})".format(
+                target["fs"], target["mountpoint"], target["device"]))
+    errors = []
+    if not dry_run:
+        for target in group["targets"]:
+            try:
+                if not grow_filesystem(target):
+                    print("SKIP: {0}: filesystem already uses the available block device capacity".format(target["mountpoint"]))
+            except Exception as error:
+                errors.append("{0}: {1}".format(target["mountpoint"], error))
+    if errors:
+        raise RuntimeError("; ".join(errors))
 
 
 def process_target(target, dry_run):
@@ -310,6 +546,7 @@ def process_target(target, dry_run):
                 target["device"], state["free"]))
         print("DRY-RUN: check/grow {0} filesystem {1}".format(target["fs"], target["device"]))
         return
+    changed = bool(grow)
     if part:
         resize_partition(disk_path, part["path"], grow)
     if state:
@@ -323,12 +560,16 @@ def process_target(target, dry_run):
             refreshed = lvm_state(target)
             if integer(refreshed["pv"]["pv_pe_count"]) > integer(pv["pv_pe_count"]):
                 print("CHANGED: PV " + pv_path)
+                changed = True
             state = refreshed
         if state["free"] > 0:
             run(["lvextend", "-l", "+{0}".format(state["free"]), target["device"], pv_path])
             print("CHANGED: LV " + target["device"])
+            changed = True
     # Reruns must finish an FS resize even if partition/PV/LV already grew.
-    grow_filesystem(target)
+    if not grow_filesystem(target) and not changed:
+        print("SKIP: {0}: no additional usable space; filesystem already uses the available capacity".format(
+            target["mountpoint"] or target["device"]))
 
 
 @contextlib.contextmanager
@@ -342,24 +583,41 @@ def mutation_lock():
 
 
 def execute(args):
+    requests = parse_mountpoints(getattr(args, "mountpoints", ""))
     devices = load_lsblk()
     selected = {os.path.realpath(path) for path in args.disk}
     known = {n["path"] for n in walk(devices) if supported_disk(n)}
     if selected - known:
         raise RuntimeError("Unknown or unsupported selected disks: " + ", ".join(sorted(selected - known)))
+    if requests:
+        # Catch typos, unsupported targets and filter conflicts before rescanning.
+        discover_targets(devices, selected, requests)
     if not args.dry_run:
         rescan_block_devices([n for n in walk(devices) if supported_disk(n) and (not selected or n["path"] in selected)])
         devices = load_lsblk()
     else:
         print("DRY-RUN: no device rescan; planning uses sizes currently visible to the kernel")
-    targets, skipped = discover_targets(devices, selected)
+    targets, skipped = discover_targets(devices, selected, requests)
     for line in skipped:
         print(line)
+    # All explicit budgets and conflicts are checked before ANY partition/PV/LV write.
+    groups = prepare_explicit_targets(targets)
     errors = []
+    for group in groups:
+        label = ", ".join(t["mountpoint"] for t in group["targets"])
+        print("FOUND: selected " + label)
+        try:
+            process_explicit_group(group, args.dry_run)
+        except Exception as error:
+            errors.append("ERROR: {0}: {1}".format(label, error))
     for target in targets:
+        if target.get("explicit"):
+            continue
         print("FOUND: {0} {1}".format(target["kind"], target["device"]))
         try:
             process_target(target, args.dry_run)
+        except AmbiguousTarget as error:
+            print("SKIP: {0}: {1}".format(target["device"], error))
         except Exception as error:
             errors.append("ERROR: {0}: {1}".format(target["device"], error))
     for error in errors:
@@ -373,6 +631,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dry-run", action="store_true", help="inspect only; do not rescan or resize devices")
     parser.add_argument("--disk", action="append", default=[], help="limit processing to this disk; repeat as needed")
+    parser.add_argument("--mountpoints", default="", help="per-disk overrides: '/data=20GiB, /logs' or '/data=40%, /logs=60%'")
     args = parser.parse_args()
     if args.dry_run:
         return execute(args)
