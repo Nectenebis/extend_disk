@@ -139,5 +139,49 @@ class FilesystemImages(unittest.TestCase):
             self.assertNotIn("CHANGED:", output.getvalue())
 
 
+@unittest.skipUnless(all(shutil.which(tool) for tool in ("sfdisk", "fatresize", "mkfs.fat", "fsck.fat")),
+                     "requires sfdisk, fatresize and dosfstools")
+class FatImages(unittest.TestCase):
+    def test_native_fat32_growth_preserves_efi_metadata_and_volume_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            disk, filesystem = Path(tmp) / "disk.img", Path(tmp) / "fat.img"
+            with disk.open("wb") as stream:
+                stream.truncate(1200 * MIB)
+            with filesystem.open("wb") as stream:
+                stream.truncate(600 * MIB)
+            subprocess.run(["mkfs.fat", "-F", "32", str(filesystem)], check=True, capture_output=True)
+            old_geometry = h.fat_geometry(str(filesystem))
+            subprocess.run(["sfdisk", str(disk)], input="label:gpt\nsize=600M,type=U,name=EFI\n",
+                           text=True, capture_output=True, check=True)
+            with disk.open("r+b") as output, filesystem.open("rb") as source:
+                output.seek(MIB)
+                shutil.copyfileobj(source, output, length=MIB)
+            before = json.loads(subprocess.check_output(["sfdisk", "--json", str(disk)], text=True))["partitiontable"]
+            result = subprocess.run(["fatresize", str(disk), "--partition", "1", "--size", str(900 * MIB)],
+                                    stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            after = json.loads(subprocess.check_output(["sfdisk", "--json", str(disk)], text=True))["partitiontable"]
+            for key in ("start", "uuid", "type", "name"):
+                self.assertEqual(after["partitions"][0][key], before["partitions"][0][key])
+            self.assertEqual(after["id"], before["id"])
+            self.assertGreater(after["partitions"][0]["size"], before["partitions"][0]["size"])
+            with disk.open("rb") as source:
+                source.seek(after["partitions"][0]["start"] * after["sectorsize"])
+                geometry = h.parse_fat_boot_sector(source.read(512))
+                self.assertEqual(geometry["bits"], 32)
+                self.assertEqual(geometry["volume_id"], old_geometry["volume_id"])
+                self.assertGreater(geometry["sectors"], old_geometry["sectors"])
+                source.seek(after["partitions"][0]["start"] * after["sectorsize"])
+                with filesystem.open("wb") as output:
+                    remaining = after["partitions"][0]["size"] * after["sectorsize"]
+                    while remaining:
+                        chunk = source.read(min(MIB, remaining))
+                        self.assertTrue(chunk)
+                        output.write(chunk)
+                        remaining -= len(chunk)
+            checked = subprocess.run(["fsck.fat", "-n", str(filesystem)], capture_output=True, text=True)
+            self.assertEqual(checked.returncode, 0, checked.stdout + checked.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -30,4 +30,11 @@ extend_disk_devices: []
 # Per-disk overrides; other disks keep automatic selection. Comma/space separated.
 # Bare path gets the VG remainder; sizes are ADDED, percentages use post-growth VG free space.
 # Examples: "/second_data", "/data=20GiB, /logs", "/data=40% /logs=60%".
+# Units are case-insensitive: GB/gb=1000^3, GiB/gib=1024^3. FAT32 also accepts sizes.
 extend_disk_mountpoints: ""
+
+# FAT32 needs offline resizing. A busy filesystem is never force/lazy unmounted.
+extend_disk_allow_unmount: false
+extend_disk_fat_packages:
+  - dosfstools
+  - fatresize
