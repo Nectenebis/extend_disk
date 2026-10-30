@@ -18,7 +18,7 @@ jobs:
       - name: Install disk tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y cloud-guest-utils fdisk e2fsprogs dosfstools fatresize
+          sudo apt-get install -y cloud-guest-utils fdisk e2fsprogs
       - name: Run unit and disk-image tests
         run: python -m unittest discover -s tests -v
       - name: Install Ansible

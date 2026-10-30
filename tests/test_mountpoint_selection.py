@@ -15,6 +15,20 @@ def selected_target(path, spec="", device=None):
     return target
 
 
+class Units(unittest.TestCase):
+    def test_decimal_and_binary_units_all_cases(self):
+        for unit, multiplier in {"B": 1, "KB": 1000, "MB": 1000 ** 2, "GB": 1000 ** 3, "TB": 1000 ** 4,
+                                 "KiB": 1024, "MiB": 1024 ** 2, "GiB": 1024 ** 3, "TiB": 1024 ** 4}.items():
+            for spelling in {unit, unit.lower(), unit.upper(), unit.title()}:
+                with self.subTest(unit=spelling):
+                    spec = h.parse_mountpoints("/data=2" + spelling)[0]["allocation"]
+                    self.assertEqual(spec, dict(type="bytes", value=2 * multiplier))
+
+    def test_decimal_fraction_and_duplicate_equivalence(self):
+        self.assertEqual(h.parse_mountpoints("/data=1.5gb")[0]["allocation"]["value"], 1500000000)
+        self.assertEqual(len(h.parse_mountpoints("/data=1GB /data=1000mb")), 1)
+
+
 class Input(unittest.TestCase):
     def test_mixed_separators_sizes_percent_and_remainder(self):
         values = h.parse_mountpoints(" /data=20GiB, /logs\n/archive=12.5% ")

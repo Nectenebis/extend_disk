@@ -11,16 +11,13 @@ environment.filters.update(FilterModule().filters())
 cases = 0
 for dry_run in (False, True):
     for disks in ([], ["/dev/sda", "/dev/disk/by-id/scsi-example"]):
-        for mountpoints in ("", "  ", "/data=20gb, /logs", "/boot/efi=1GiB"):
-            for allow_unmount in (False, True):
-                actual = environment.compile_expression(expression.strip()[2:-2])(
-                    extend_disk_dry_run=dry_run, extend_disk_devices=disks, extend_disk_mountpoints=mountpoints,
-                    extend_disk_allow_unmount=allow_unmount)
-                expected = ["/usr/local/sbin/extend-free-space"]
-                expected += ["--dry-run"] if dry_run else []
-                expected += ["--allow-unmount"] if allow_unmount else []
-                expected += ["--mountpoints=" + mountpoints] if mountpoints.strip() else []
-                expected += ["--disk=" + path for path in disks]
-                assert actual == expected, (actual, expected)
-                cases += 1
+        for mountpoints in ("", "  ", "/data=20gb, /logs", "/data=40% /logs=60%"):
+            actual = environment.compile_expression(expression.strip()[2:-2])(
+                extend_disk_dry_run=dry_run, extend_disk_devices=disks, extend_disk_mountpoints=mountpoints)
+            expected = ["/usr/local/sbin/extend-free-space"]
+            expected += ["--dry-run"] if dry_run else []
+            expected += ["--mountpoints=" + mountpoints] if mountpoints.strip() else []
+            expected += ["--disk=" + path for path in disks]
+            assert actual == expected, (actual, expected)
+            cases += 1
 print("Ansible argv: {0} cases passed".format(cases))

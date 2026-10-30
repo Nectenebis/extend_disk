@@ -7,13 +7,16 @@ import fcntl
 import json
 import os
 import re
-import shutil
-import struct
 import subprocess
 import sys
 import time
 
-SUPPORTED_FS = {"xfs", "ext4", "vfat"}
+PROTECTED_PARTTYPES = {
+    "c12a7328-f81f-11d2-ba4b-00a0c93ec93b",  # EFI System
+    "21686148-6449-6e6f-744e-656564454649",  # BIOS boot
+    "bc13c2ff-59e6-4262-a352-b275fd6f7172",  # Extended Boot Loader
+    "0xef", "ef",  # MBR EFI System
+}
 SUPPORTED_DISK_RE = r"^(sd[a-z]+|vd[a-z]+|xvd[a-z]+|nvme[0-9]+n[0-9]+)$"
 
 
@@ -44,7 +47,7 @@ def walk(nodes, parent=None):
 
 
 def load_lsblk():
-    columns = "NAME,PATH,TYPE,PKNAME,FSTYPE,MOUNTPOINTS,RM,SIZE"
+    columns = "NAME,PATH,TYPE,PKNAME,FSTYPE,MOUNTPOINTS,RM,SIZE,PARTTYPE"
     argv = ["lsblk", "-b", "-J", "-o", columns]
     result = command(argv)
     if result.returncode and "unknown column" in result.stderr.lower():
@@ -58,6 +61,11 @@ def mountpoints(node):
     return [p for p in ([points] if isinstance(points, str) else points) if p]
 
 
+def protected_mountpoint(path):
+    path = os.path.normpath(path)
+    return any(path == base or path.startswith(base + "/") for base in ("/boot", "/efi"))
+
+
 def node_fstype(node):
     if node.get("fstype"):
         return node["fstype"]
@@ -67,7 +75,7 @@ def node_fstype(node):
 
 def can_grow_filesystem(node):
     fs = node_fstype(node)
-    return fs == "ext4" or (fs in {"xfs", "vfat"} and bool(mountpoints(node)))
+    return fs == "ext4" or (fs == "xfs" and bool(mountpoints(node)))
 
 
 def disk_for(node):
@@ -115,6 +123,8 @@ def parse_mountpoints(value):
         if not path.startswith("/"):
             raise ValueError("Use an absolute mountpoint: " + entry)
         path = os.path.normpath(path)
+        if protected_mountpoint(path):
+            raise ValueError("Boot filesystems are excluded; manage them manually: " + path)
         allocation = dict(type="all")
         if separator:
             match = re.fullmatch(r"(\d+(?:\.\d+)?)(%|B|[KMGT]i?B)", amount, re.I)
@@ -138,6 +148,9 @@ def parse_mountpoints(value):
 
 def discover_targets(blockdevices, selected=None, requests=None):
     nodes = list(walk(blockdevices))
+    protected = {os.path.realpath(n["path"]) for n in nodes
+                 if any(protected_mountpoint(p) for p in mountpoints(n))
+                 or (n.get("parttype") or "").lower() in PROTECTED_PARTTYPES}
     root = find_root_node(nodes)
     if root is None and not selected:
         raise RuntimeError("Cannot identify the root block device; use --disk for explicitly selected data disks")
@@ -150,15 +163,17 @@ def discover_targets(blockdevices, selected=None, requests=None):
                 raise RuntimeError(message)
             skipped.append("SKIP: " + message)
 
+        ancestor = device
+        while ancestor and ancestor.get("type") != "disk":
+            if os.path.realpath(ancestor["path"]) in protected:
+                reject("boot filesystem/partition is excluded; manage it manually: " + device["path"])
+                return
+            ancestor = ancestor.get("parent")
         if not supported_disk(disk):
             reject("unsupported physical disk for " + device["path"])
             return
         if not can_grow_filesystem(device):
             reject("unsupported or unmounted filesystem {0}: {1}".format(node_fstype(device) or "unknown", device["path"]))
-            return
-        fs = node_fstype(device)
-        if fs == "vfat" and (not request or pv is not None):
-            reject("FAT resize requires an explicitly selected ordinary partition: " + device["path"])
             return
         parent = device.get("parent") or {}
         if pv is None and (device.get("type") != "part" or parent.get("type") != "disk"
@@ -169,8 +184,7 @@ def discover_targets(blockdevices, selected=None, requests=None):
                                     (pv.get("type") == "part" and pv.get("parent", {}).get("type") == "disk")):
             reject("unsupported PV storage layers: " + device["path"])
             return
-        if request and pv is None and request["allocation"]["type"] != "all" and not (
-                fs == "vfat" and request["allocation"]["type"] == "bytes"):
+        if request and pv is None and request["allocation"]["type"] != "all":
             raise RuntimeError("Sizes and percentages require an LVM logical volume: " + request["mountpoint"])
         targets.append(dict(kind=kind, device=device["path"], disk=disk, pv=pv,
                             part=(pv if pv and pv["type"] == "part" else device if pv is None else None),
@@ -381,147 +395,12 @@ def filesystem_geometry(target):
         size = re.search(r"^Block size:\s+(\d+)\s*$", output, re.M)
         if count and size:
             return int(count.group(1)), int(size.group(1))
-    elif target["fs"] == "vfat":
-        geometry = fat_geometry(target["device"])
-        return geometry["sectors"], geometry["sector_size"]
     else:
         output = run(["xfs_info", target["mountpoint"]])
         match = re.search(r"data\s*=\s*bsize=(\d+)\s+blocks=(\d+)", output)
         if match:
             return int(match.group(2)), int(match.group(1))
     raise RuntimeError("Cannot read filesystem geometry for " + target["device"])
-
-
-def parse_fat_boot_sector(data):
-    if len(data) < 512 or data[510:512] != b"\x55\xaa":
-        raise RuntimeError("Invalid FAT boot sector")
-    sector_size = struct.unpack_from("<H", data, 11)[0]
-    sectors_per_cluster = data[13]
-    reserved = struct.unpack_from("<H", data, 14)[0]
-    fats = data[16]
-    root_entries = struct.unpack_from("<H", data, 17)[0]
-    sectors = struct.unpack_from("<H", data, 19)[0] or struct.unpack_from("<I", data, 32)[0]
-    fat16_size = struct.unpack_from("<H", data, 22)[0]
-    fat_size = fat16_size or struct.unpack_from("<I", data, 36)[0]
-    if (sector_size not in (512, 1024, 2048, 4096) or sectors_per_cluster == 0
-            or sectors_per_cluster & (sectors_per_cluster - 1) or not reserved or not fats or not fat_size):
-        raise RuntimeError("Invalid FAT geometry")
-    root_sectors = (root_entries * 32 + sector_size - 1) // sector_size
-    clusters = (sectors - reserved - fats * fat_size - root_sectors) // sectors_per_cluster
-    if clusters <= 0:
-        raise RuntimeError("Invalid FAT cluster count")
-    bits = 12 if clusters < 4085 else 16 if clusters < 65525 else 32
-    if bits == 32 and (fat16_size or root_entries):
-        raise RuntimeError("Inconsistent FAT32 geometry")
-    uuid_offset = 67 if bits == 32 else 39
-    return dict(sectors=sectors, sector_size=sector_size, bits=bits,
-                volume_id=data[uuid_offset:uuid_offset + 4].hex())
-
-
-def fat_geometry(path):
-    with open(path, "rb") as stream:
-        return parse_fat_boot_sector(stream.read(512))
-
-
-def fat_mount(target):
-    mounts = json.loads(run(["findmnt", "--json", "--list", "-o", "TARGET,SOURCE,FSTYPE,OPTIONS,FSROOT"]))["filesystems"]
-    same_device = [m for m in mounts if os.path.realpath(m["source"]) == os.path.realpath(target["device"])]
-    matching = [m for m in same_device if m["target"] == target["mountpoint"] and m["fsroot"] == "/"]
-    if len(same_device) != 1 or len(matching) != 1 or matching[0]["fstype"] != "vfat":
-        raise RuntimeError("FAT resize requires exactly one ordinary mount, without bind aliases: " + target["device"])
-    if any(m["target"].startswith(target["mountpoint"].rstrip("/") + "/") for m in mounts):
-        raise RuntimeError("Nested mounts prevent offline FAT resize: " + target["mountpoint"])
-    return matching[0]
-
-
-def plan_fat_growth(target, partition, allow_unmount, dry_run):
-    geometry = fat_geometry(target["device"])
-    table = partition_table(partition["disk"])
-    part = next(p for p in table["partitions"] if os.path.realpath(p["node"]) == os.path.realpath(partition["path"]))
-    before = integer(part["size"]) * integer(table["sectorsize"])
-    maximum = partition["expected"]
-    desired = maximum
-    spec = target["allocation"]
-    if spec["type"] == "bytes":
-        sector = integer(table["sectorsize"])
-        desired = before + ((spec["value"] + sector - 1) // sector) * sector
-        if maximum == before:
-            desired = before  # No adjacent space is a successful SKIP, including fixed requests.
-        elif desired > maximum:
-            raise RuntimeError("Insufficient contiguous space after {0}: requested {1} extra bytes, available {2}".format(
-                target["device"], desired - before, maximum - before))
-    fs_size = geometry["sectors"] * geometry["sector_size"]
-    # FAT geometry can leave a few sectors unused due to clusters/track alignment.
-    action = desired - fs_size >= 1024 ** 2
-    if not action:
-        return dict(action=False, desired=desired, geometry=geometry)
-    if geometry["bits"] != 32:
-        raise RuntimeError("Only FAT32 offline growth is supported; found FAT{0}".format(geometry["bits"]))
-    if table["label"] != "gpt" or part.get("type", "").upper() not in {
-            "C12A7328-F81F-11D2-BA4B-00A0C93EC93B", "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7"}:
-        raise RuntimeError("FAT32 offline growth requires a GPT EFI System or Microsoft Basic Data partition")
-    if not allow_unmount and not dry_run:
-        raise RuntimeError("FAT32 cannot grow online. Set extend_disk_allow_unmount=true / --allow-unmount "
-                           "to allow a temporary ordinary unmount: " + target["mountpoint"])
-    mount = fat_mount(target)
-    if not dry_run:
-        for tool in ("fatresize", "fsck.fat", "mount", "umount"):
-            if not shutil.which(tool):
-                raise RuntimeError("Required offline FAT tool is missing: " + tool)
-    return dict(action=True, desired=desired, maximum=maximum, geometry=geometry, mount=mount,
-                table=table, partition=part)
-
-
-def grow_fat(target, plan):
-    if not plan["action"]:
-        print("SKIP: {0}: no contiguous usable space after {1}; adjacent partitions are not moved".format(
-            target["mountpoint"], target["device"]))
-        return
-    mount = plan["mount"]
-    # No force/lazy unmount: a busy filesystem fails before partition/FS writes.
-    run(["umount", "--", mount["target"]])
-    error = None
-    try:
-        run(["fsck.fat", "-n", target["device"]])
-        argv = ["fatresize", target["disk"]["path"], "--partition", part_number(target["device"]),
-                "--size", str(plan["desired"])]
-        # No automatic Yes/Ignore answers to libparted warnings.
-        result = subprocess.run(argv, stdin=subprocess.DEVNULL, text=True, capture_output=True,
-                                env=dict(os.environ, LC_ALL="C"))
-        after_table = partition_table(target["disk"]["path"])
-        after = next(p for p in after_table["partitions"] if p["node"] == plan["partition"]["node"])
-        expected_table = json.loads(json.dumps(plan["table"]))
-        expected_part = next(p for p in expected_table["partitions"] if p["node"] == after["node"])
-        expected_part["size"] = after["size"]
-        if ("lastlba" in expected_table and after_table["lastlba"] >= expected_table["lastlba"]
-                and after_table["lastlba"] < device_size(target["disk"]["path"]) // integer(after_table["sectorsize"])):
-            expected_table["lastlba"] = after_table["lastlba"]  # Relocated backup GPT after disk growth.
-        if after_table != expected_table or after["size"] < plan["partition"]["size"]:
-            raise RuntimeError("Unexpected partition metadata change during FAT resize")
-        if after["size"] * integer(after_table["sectorsize"]) > plan["maximum"]:
-            raise RuntimeError("FAT resize exceeded the planned contiguous space")
-        if after["size"] > plan["partition"]["size"]:
-            print("CHANGED: partition " + target["device"])
-        checked(result, argv)
-        # Synchronize kernel size; never expand a mounted FAT filesystem.
-        resize_partition(target["disk"]["path"], target["device"], False)
-        geometry = fat_geometry(target["device"])
-        if geometry["bits"] != 32 or geometry["volume_id"] != plan["geometry"]["volume_id"]:
-            raise RuntimeError("FAT type or volume ID changed unexpectedly")
-        if geometry["sectors"] * geometry["sector_size"] > device_size(target["device"]):
-            raise RuntimeError("FAT filesystem exceeds its partition")
-        run(["fsck.fat", "-n", target["device"]])
-        if geometry["sectors"] > plan["geometry"]["sectors"]:
-            print("CHANGED: FAT32 filesystem " + target["device"])
-    except Exception as failure:
-        error = str(failure)
-    finally:
-        try:
-            run(["mount", "-t", "vfat", "-o", mount["options"], mount["source"], mount["target"]])
-        except Exception as failure:
-            error = (error + "; " if error else "") + "Failed to restore FAT mount {0}: {1}".format(mount["target"], failure)
-    if error:
-        raise RuntimeError(error)
 
 
 def grow_filesystem(target):
@@ -577,7 +456,7 @@ def allocate_extents(targets, free, extent_size):
     return allocations
 
 
-def prepare_explicit_targets(targets, allow_unmount=False, dry_run=False):
+def prepare_explicit_targets(targets):
     groups, partitions = {}, {}
     for target in targets:
         if not target.get("explicit"):
@@ -603,9 +482,6 @@ def prepare_explicit_targets(targets, allow_unmount=False, dry_run=False):
     for group in groups.values():
         state = group["state"]
         if state is None:
-            target = group["targets"][0]
-            if target["fs"] == "vfat":
-                group["fat"] = plan_fat_growth(target, group["partitions"][0], allow_unmount, dry_run)
             continue
         target = group["targets"][0]
         if len(group["partitions"]) > 1:
@@ -625,15 +501,6 @@ def prepare_explicit_targets(targets, allow_unmount=False, dry_run=False):
 
 
 def process_explicit_group(group, dry_run):
-    if "fat" in group:
-        target, plan = group["targets"][0], group["fat"]
-        if dry_run:
-            print("DRY-RUN: {0}: FAT{1} offline growth={2}, requested partition bytes={3}; {4}".format(
-                target["mountpoint"], plan["geometry"]["bits"], plan["action"], plan["desired"],
-                "temporary unmount requires extend_disk_allow_unmount=true" if plan["action"] else "no resize needed"))
-        else:
-            grow_fat(target, plan)
-        return
     state = group["state"]
     for partition in group["partitions"]:
         if dry_run:
@@ -756,7 +623,7 @@ def execute(args):
     for line in skipped:
         print(line)
     # All explicit budgets and conflicts are checked before ANY partition/PV/LV write.
-    groups = prepare_explicit_targets(targets, allow_unmount=getattr(args, "allow_unmount", False), dry_run=args.dry_run)
+    groups = prepare_explicit_targets(targets)
     errors = []
     for group in groups:
         label = ", ".join(t["mountpoint"] for t in group["targets"])
@@ -787,7 +654,6 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="inspect only; do not rescan or resize devices")
     parser.add_argument("--disk", action="append", default=[], help="limit processing to this disk; repeat as needed")
     parser.add_argument("--mountpoints", default="", help="per-disk overrides: '/data=20GiB, /logs' or '/data=40%%, /logs=60%%'")
-    parser.add_argument("--allow-unmount", action="store_true", help="allow a temporary ordinary unmount for explicit FAT32 growth")
     args = parser.parse_args()
     if args.dry_run:
         return execute(args)
